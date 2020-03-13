@@ -14,7 +14,8 @@ const AP_Param::GroupInfo AP_Mission::var_info[] = {
     // @Range: 0 32766
     // @Increment: 1
     // @User: Advanced
-    AP_GROUPINFO("TOTAL",  0, AP_Mission, _cmd_total, 0),
+    // @ReadOnly: True
+    AP_GROUPINFO_FLAGS("TOTAL",  0, AP_Mission, _cmd_total, 0, AP_PARAM_FLAG_INTERNAL_USE_ONLY),
 
     // @Param: RESTART
     // @DisplayName: Mission Restart when entering Auto mode
@@ -26,7 +27,7 @@ const AP_Param::GroupInfo AP_Mission::var_info[] = {
     // @Param: OPTIONS
     // @DisplayName: Mission options bitmask
     // @Description: Bitmask of what options to use in missions.
-    // @Bitmask: 0:Clear Mission on reboot
+    // @Bitmask: 0:Clear Mission on reboot, 1:Use distance to land calc on battery failsafe
     // @User: Advanced
     AP_GROUPINFO("OPTIONS",  2, AP_Mission, _options, AP_MISSION_OPTIONS_DEFAULT),
 
@@ -38,7 +39,7 @@ extern const AP_HAL::HAL& hal;
 // storage object
 StorageAccess AP_Mission::_storage(StorageManager::StorageMission);
 
-HAL_Semaphore_Recursive AP_Mission::_rsem;
+HAL_Semaphore AP_Mission::_rsem;
 
 ///
 /// public mission methods
@@ -67,7 +68,7 @@ void AP_Mission::start()
     _flags.state = MISSION_RUNNING;
 
     reset(); // reset mission to the first command, resets jump tracking
-    
+
     // advance to the first command
     if (!advance_current_nav_cmd()) {
         // on failure set mission complete
@@ -109,6 +110,24 @@ void AP_Mission::resume()
         // flying to a command that has been excluded from the current mission
         start();
         return;
+    }
+
+    // rewind the mission wp if the repeat distance has been set via MAV_CMD_DO_SET_RESUME_REPEAT_DIST
+    if (_repeat_dist > 0 && _wp_index_history[LAST_WP_PASSED] != AP_MISSION_CMD_INDEX_NONE) {
+        // if not already in a resume state calculate the position to rewind to
+        Mission_Command tmp_cmd;
+        if (!_flags.resuming_mission && calc_rewind_pos(tmp_cmd)) { 
+            _resume_cmd = tmp_cmd;
+        }
+
+        // resume mission to rewound position
+        if (_resume_cmd.index != AP_MISSION_CMD_INDEX_NONE && start_command(_resume_cmd)) {
+            _nav_cmd = _resume_cmd;
+            _flags.nav_cmd_loaded = true;
+            // set flag to prevent history being re-written
+            _flags.resuming_mission = true;
+            return;
+        }
     }
 
     // restart active navigation command. We run these on resume()
@@ -162,10 +181,11 @@ bool AP_Mission::starts_with_takeoff_cmd()
 /// start_or_resume - if MIS_AUTORESTART=0 this will call resume(), otherwise it will call start()
 void AP_Mission::start_or_resume()
 {
-    if (_restart) {
+    if (_restart == 1 && !_force_resume) {
         start();
     } else {
         resume();
+        _force_resume = false;
     }
 }
 
@@ -175,12 +195,14 @@ void AP_Mission::reset()
     _flags.nav_cmd_loaded  = false;
     _flags.do_cmd_loaded   = false;
     _flags.do_cmd_all_done = false;
+    _flags.in_landing_sequence = false;
     _nav_cmd.index         = AP_MISSION_CMD_INDEX_NONE;
     _do_cmd.index          = AP_MISSION_CMD_INDEX_NONE;
     _prev_nav_cmd_index    = AP_MISSION_CMD_INDEX_NONE;
     _prev_nav_cmd_wp_index = AP_MISSION_CMD_INDEX_NONE;
     _prev_nav_cmd_id       = AP_MISSION_CMD_ID_NONE;
     init_jump_tracking();
+    reset_wp_history();
 }
 
 /// clear - clears out mission
@@ -222,6 +244,8 @@ void AP_Mission::update()
     if (_flags.state != MISSION_RUNNING || _cmd_total == 0) {
         return;
     }
+
+    update_exit_position();
 
     // save persistent waypoint_num for watchdog restore
     hal.util->persistent_data.waypoint_num = _nav_cmd.index;
@@ -273,6 +297,7 @@ bool AP_Mission::verify_command(const Mission_Command& cmd)
     case MAV_CMD_DO_DIGICAM_CONTROL:
     case MAV_CMD_DO_SET_CAM_TRIGG_DIST:
     case MAV_CMD_DO_PARACHUTE:
+    case MAV_CMD_DO_SET_RESUME_REPEAT_DIST:
         return true;
     default:
         return _cmd_verify_fn(cmd);
@@ -281,6 +306,11 @@ bool AP_Mission::verify_command(const Mission_Command& cmd)
 
 bool AP_Mission::start_command(const Mission_Command& cmd)
 {
+    // check for landing related commands and set in_landing_sequence flag
+    if (is_landing_type_cmd(cmd.id) || cmd.id == MAV_CMD_DO_LAND_START) {
+        set_in_landing_sequence_flag(true);
+    }
+
     gcs().send_text(MAV_SEVERITY_INFO, "Mission: %u %s", cmd.index, cmd.type());
     switch (cmd.id) {
     case MAV_CMD_DO_GRIPPER:
@@ -297,6 +327,8 @@ bool AP_Mission::start_command(const Mission_Command& cmd)
         return start_command_camera(cmd);
     case MAV_CMD_DO_PARACHUTE:
         return start_command_parachute(cmd);
+    case MAV_CMD_DO_SET_RESUME_REPEAT_DIST:
+        return command_do_set_repeat_dist(cmd);
     default:
         return _cmd_start_fn(cmd);
     }
@@ -388,8 +420,19 @@ int32_t AP_Mission::get_next_ground_course_cd(int32_t default_angle)
 }
 
 // set_current_cmd - jumps to command specified by index
-bool AP_Mission::set_current_cmd(uint16_t index)
+bool AP_Mission::set_current_cmd(uint16_t index, bool rewind)
 {
+    // read command to check for DO_LAND_START
+    Mission_Command cmd;
+    if (!read_cmd_from_storage(index, cmd) || (cmd.id != MAV_CMD_DO_LAND_START)) {
+        _flags.in_landing_sequence = false;
+    }
+
+    // mission command has been set and not as rewind command, don't track history.
+    if (!rewind) {
+        reset_wp_history();
+    }
+
     // sanity check index and that we have a mission
     if (index >= (unsigned)_cmd_total || _cmd_total == 1) {
         return false;
@@ -421,7 +464,6 @@ bool AP_Mission::set_current_cmd(uint16_t index)
         // search until we find next nav command or reach end of command list
         while (!_flags.nav_cmd_loaded) {
             // get next command
-            Mission_Command cmd;
             if (!get_next_cmd(index, cmd, true)) {
                 _nav_cmd.index = AP_MISSION_CMD_INDEX_NONE;
                 return false;
@@ -505,57 +547,65 @@ bool AP_Mission::read_cmd_from_storage(uint16_t index, Mission_Command& cmd) con
 {
     WITH_SEMAPHORE(_rsem);
 
-    // exit immediately if index is beyond last command but we always let cmd #0 (i.e. home) be read
-    if (index >= (unsigned)_cmd_total && index != 0) {
-        return false;
-    }
-
     // special handling for command #0 which is home
     if (index == 0) {
         cmd.index = 0;
         cmd.id = MAV_CMD_NAV_WAYPOINT;
         cmd.p1 = 0;
         cmd.content.location = AP::ahrs().get_home();
-    }else{
-        // Find out proper location in memory by using the start_byte position + the index
-        // we can load a command, we don't process it yet
-        // read WP position
-        uint16_t pos_in_storage = 4 + (index * AP_MISSION_EEPROM_COMMAND_SIZE);
-
-        PackedContent packed_content;
-
-        uint8_t b1 = _storage.read_byte(pos_in_storage);
-        if (b1 == 0) {
-            cmd.id = _storage.read_uint16(pos_in_storage+1);
-            cmd.p1 = _storage.read_uint16(pos_in_storage+3);
-            _storage.read_block(packed_content.bytes, pos_in_storage+5, 10);
-        } else {
-            cmd.id = b1;
-            cmd.p1 = _storage.read_uint16(pos_in_storage+1);
-            _storage.read_block(packed_content.bytes, pos_in_storage+3, 12);
-        }
-
-        if (stored_in_location(cmd.id)) {
-            // Location is not PACKED; field-wise copy it:
-            cmd.content.location.relative_alt = packed_content.location.flags.relative_alt;
-            cmd.content.location.loiter_ccw = packed_content.location.flags.loiter_ccw;
-            cmd.content.location.terrain_alt = packed_content.location.flags.terrain_alt;
-            cmd.content.location.origin_alt = packed_content.location.flags.origin_alt;
-            cmd.content.location.loiter_xtrack = packed_content.location.flags.loiter_xtrack;
-            cmd.content.location.alt = packed_content.location.alt;
-            cmd.content.location.lat = packed_content.location.lat;
-            cmd.content.location.lng = packed_content.location.lng;
-        } else {
-            // all other options in Content are assumed to be packed:
-            static_assert(sizeof(cmd.content) >= 12,
-                          "content is big enough to take bytes");
-            // (void *) cast to specify gcc that we know that we are copy byte into a non trivial type and leaving 4 bytes untouched
-            memcpy((void *)&cmd.content, packed_content.bytes, 12);
-        }
-
-        // set command's index to it's position in eeprom
-        cmd.index = index;
+        return true;
     }
+
+    if (index >= (unsigned)_cmd_total) {
+        return false;
+    }
+
+    // Find out proper location in memory by using the start_byte position + the index
+    // we can load a command, we don't process it yet
+    // read WP position
+    const uint16_t pos_in_storage = 4 + (index * AP_MISSION_EEPROM_COMMAND_SIZE);
+
+    PackedContent packed_content {};
+
+    const uint8_t b1 = _storage.read_byte(pos_in_storage);
+    if (b1 == 0) {
+        cmd.id = _storage.read_uint16(pos_in_storage+1);
+        cmd.p1 = _storage.read_uint16(pos_in_storage+3);
+        _storage.read_block(packed_content.bytes, pos_in_storage+5, 10);
+    } else {
+        cmd.id = b1;
+        cmd.p1 = _storage.read_uint16(pos_in_storage+1);
+        _storage.read_block(packed_content.bytes, pos_in_storage+3, 12);
+    }
+
+    if (stored_in_location(cmd.id)) {
+#if CONFIG_HAL_BOARD == HAL_BOARD_SITL
+        // NOTE!  no 16-bit command may be stored_in_location as only
+        // 10 bytes are available for storage and lat/lon/alt required
+        // 4*sizeof(float) == 12 bytes of storage.
+        if (b1 == 0) {
+            AP_HAL::panic("May not store location for 16-bit commands");
+        }
+#endif
+        // Location is not PACKED; field-wise copy it:
+        cmd.content.location.relative_alt = packed_content.location.flags.relative_alt;
+        cmd.content.location.loiter_ccw = packed_content.location.flags.loiter_ccw;
+        cmd.content.location.terrain_alt = packed_content.location.flags.terrain_alt;
+        cmd.content.location.origin_alt = packed_content.location.flags.origin_alt;
+        cmd.content.location.loiter_xtrack = packed_content.location.flags.loiter_xtrack;
+        cmd.content.location.alt = packed_content.location.alt;
+        cmd.content.location.lat = packed_content.location.lat;
+        cmd.content.location.lng = packed_content.location.lng;
+    } else {
+        // all other options in Content are assumed to be packed:
+        static_assert(sizeof(cmd.content) >= 12,
+                      "content is big enough to take bytes");
+        // (void *) cast to specify gcc that we know that we are copy byte into a non trivial type and leaving 4 bytes untouched
+        memcpy((void *)&cmd.content, packed_content.bytes, 12);
+    }
+
+    // set command's index to it's position in eeprom
+    cmd.index = index;
 
     // return success
     return true;
@@ -599,7 +649,7 @@ bool AP_Mission::write_cmd_to_storage(uint16_t index, const Mission_Command& cmd
         return false;
     }
 
-    PackedContent packed;
+    PackedContent packed {};
     if (stored_in_location(cmd.id)) {
         // Location is not PACKED; field-wise copy it:
         packed.location.flags.relative_alt = cmd.content.location.relative_alt;
@@ -691,7 +741,7 @@ MAV_MISSION_RESULT AP_Mission::sanity_check_params(const mavlink_mission_item_in
     return MAV_MISSION_ACCEPTED;
 }
 
-// mavlink_to_mission_cmd - converts mavlink message to an AP_Mission::Mission_Command object which can be stored to eeprom
+// mavlink_int_to_mission_cmd - converts mavlink message to an AP_Mission::Mission_Command object which can be stored to eeprom
 //  return MAV_MISSION_ACCEPTED on success, MAV_MISSION_RESULT error on failure
 MAV_MISSION_RESULT AP_Mission::mavlink_int_to_mission_cmd(const mavlink_mission_item_int_t& packet, AP_Mission::Mission_Command& cmd)
 {
@@ -790,7 +840,7 @@ MAV_MISSION_RESULT AP_Mission::mavlink_int_to_mission_cmd(const mavlink_mission_
         cmd.p1 = packet.param1;                         // on/off. >0.5 means "on", hand-over control to external controller
         break;
 
-    case MAV_CMD_NAV_DELAY:                            // MAV ID: 94
+    case MAV_CMD_NAV_DELAY:                            // MAV ID: 93
         cmd.content.nav_delay.seconds = packet.param1; // delay in seconds
         cmd.content.nav_delay.hour_utc = packet.param2;// absolute time's hour (utc)
         cmd.content.nav_delay.min_utc = packet.param3;// absolute time's min (utc)
@@ -964,6 +1014,10 @@ MAV_MISSION_RESULT AP_Mission::mavlink_int_to_mission_cmd(const mavlink_mission_
         cmd.content.winch.release_rate = packet.param4; // release rate in meters/second
         break;
 
+    case MAV_CMD_DO_SET_RESUME_REPEAT_DIST:
+        cmd.p1 = packet.param1; // Resume repeat distance (m)
+        break;
+
     default:
         // unrecognised command
         return MAV_MISSION_UNSUPPORTED;
@@ -992,15 +1046,18 @@ MAV_MISSION_RESULT AP_Mission::mavlink_int_to_mission_cmd(const mavlink_mission_
 
         case MAV_FRAME_MISSION:
         case MAV_FRAME_GLOBAL:
+        case MAV_FRAME_GLOBAL_INT:
             cmd.content.location.relative_alt = 0;
             break;
 
         case MAV_FRAME_GLOBAL_RELATIVE_ALT:
+        case MAV_FRAME_GLOBAL_RELATIVE_ALT_INT:
             cmd.content.location.relative_alt = 1;
             break;
 
 #if AP_TERRAIN_AVAILABLE
         case MAV_FRAME_GLOBAL_TERRAIN_ALT:
+        case MAV_FRAME_GLOBAL_TERRAIN_ALT_INT:
             // we mark it as a relative altitude, as it doesn't have
             // home alt added
             cmd.content.location.relative_alt = 1;
@@ -1018,11 +1075,11 @@ MAV_MISSION_RESULT AP_Mission::mavlink_int_to_mission_cmd(const mavlink_mission_
     return MAV_MISSION_ACCEPTED;
 }
 
-// converts a mission_item to mission_item_int and returns a mission_command
-MAV_MISSION_RESULT AP_Mission::mavlink_to_mission_cmd(const mavlink_mission_item_t& packet, AP_Mission::Mission_Command& cmd)
+MAV_MISSION_RESULT AP_Mission::convert_MISSION_ITEM_to_MISSION_ITEM_INT(const mavlink_mission_item_t &packet,
+                                                                        mavlink_mission_item_int_t &mav_cmd)
 {
-    mavlink_mission_item_int_t mav_cmd = {};
-
+    // TODO: rename mav_cmd to mission_item_int
+    // TODO: rename packet to mission_item
     mav_cmd.param1 = packet.param1;
     mav_cmd.param2 = packet.param2;
     mav_cmd.param3 = packet.param3;
@@ -1035,6 +1092,7 @@ MAV_MISSION_RESULT AP_Mission::mavlink_to_mission_cmd(const mavlink_mission_item
     mav_cmd.frame = packet.frame;
     mav_cmd.current = packet.current;
     mav_cmd.autocontinue = packet.autocontinue;
+    mav_cmd.mission_type = packet.mission_type;
     
     /*
       the strategy for handling both MISSION_ITEM and MISSION_ITEM_INT
@@ -1063,62 +1121,56 @@ MAV_MISSION_RESULT AP_Mission::mavlink_to_mission_cmd(const mavlink_mission_item
         mav_cmd.y = packet.y * 1.0e7f;
         break;
     }
-    
-    MAV_MISSION_RESULT ans = mavlink_int_to_mission_cmd(mav_cmd, cmd);
-    
-    return ans;
+
+    return MAV_MISSION_ACCEPTED;
 }
 
-// converts a Mission_Command to mission_item_int and returns a mission_item
-bool AP_Mission::mission_cmd_to_mavlink(const AP_Mission::Mission_Command& cmd, mavlink_mission_item_t& packet)
+MAV_MISSION_RESULT AP_Mission::convert_MISSION_ITEM_INT_to_MISSION_ITEM(const mavlink_mission_item_int_t &item_int,
+                                                                        mavlink_mission_item_t &item)
 {
-    mavlink_mission_item_int_t mav_cmd = {};
-    
-    bool ans = mission_cmd_to_mavlink_int(cmd, (mavlink_mission_item_int_t&)mav_cmd);
-    
-    packet.param1 = mav_cmd.param1;
-    packet.param2 = mav_cmd.param2;
-    packet.param3 = mav_cmd.param3;
-    packet.param4 = mav_cmd.param4;
-    packet.z = mav_cmd.z;
-    packet.seq = mav_cmd.seq;
-    packet.command = mav_cmd.command;
-    packet.target_system = mav_cmd.target_system;
-    packet.target_component = mav_cmd.target_component;
-    packet.frame = mav_cmd.frame;
-    packet.current = mav_cmd.current;
-    packet.autocontinue = mav_cmd.autocontinue;
+    item.param1 = item_int.param1;
+    item.param2 = item_int.param2;
+    item.param3 = item_int.param3;
+    item.param4 = item_int.param4;
+    item.z = item_int.z;
+    item.seq = item_int.seq;
+    item.command = item_int.command;
+    item.target_system = item_int.target_system;
+    item.target_component = item_int.target_component;
+    item.frame = item_int.frame;
+    item.current = item_int.current;
+    item.autocontinue = item_int.autocontinue;
+    item.mission_type = item_int.mission_type;
 
-    /*
-      the strategy for handling both MISSION_ITEM and MISSION_ITEM_INT
-      is to pass the lat/lng in MISSION_ITEM_INT straight through, and
-      for MISSION_ITEM multiply by 1e-7 here. We need an exception for
-      any commands which use the x and y fields not as
-      latitude/longitude.
-     */
-    switch (packet.command) {
+    switch (item_int.command) {
     case MAV_CMD_DO_DIGICAM_CONTROL:
     case MAV_CMD_DO_DIGICAM_CONFIGURE:
-        packet.x = mav_cmd.x;
-        packet.y = mav_cmd.y;
+        item.x = item_int.x;
+        item.y = item_int.y;
         break;
 
     default:
         // all other commands use x and y as lat/lon. We need to
-        // multiply by 1e-7 to convert to int32_t
-        packet.x = mav_cmd.x * 1.0e-7f;
-        packet.y = mav_cmd.y * 1.0e-7f;
+        // multiply by 1e-7 to convert to float
+        item.x = item_int.x * 1.0e-7f;
+        item.y = item_int.y * 1.0e-7f;
+        if (!check_lat(item.x)) {
+            return MAV_MISSION_INVALID_PARAM5_X;
+        }
+        if (!check_lng(item.y)) {
+            return MAV_MISSION_INVALID_PARAM6_Y;
+        }
         break;
     }
-    
-    return ans;
+
+    return MAV_MISSION_ACCEPTED;
 }
 
 // mavlink_cmd_long_to_mission_cmd - converts a mavlink cmd long to an AP_Mission::Mission_Command object which can be stored to eeprom
 // return MAV_MISSION_ACCEPTED on success, MAV_MISSION_RESULT error on failure
 MAV_MISSION_RESULT AP_Mission::mavlink_cmd_long_to_mission_cmd(const mavlink_command_long_t& packet, AP_Mission::Mission_Command& cmd) 
 {
-    mavlink_mission_item_t miss_item = {0};
+    mavlink_mission_item_int_t miss_item = {0};
  
     miss_item.param1 = packet.param1;
     miss_item.param2 = packet.param2;
@@ -1129,10 +1181,10 @@ MAV_MISSION_RESULT AP_Mission::mavlink_cmd_long_to_mission_cmd(const mavlink_com
     miss_item.target_system = packet.target_system;
     miss_item.target_component = packet.target_component;
 
-    return mavlink_to_mission_cmd(miss_item, cmd);
+    return mavlink_int_to_mission_cmd(miss_item, cmd);
 }
 
-// mission_cmd_to_mavlink - converts an AP_Mission::Mission_Command object to a mavlink message which can be sent to the GCS
+// mission_cmd_to_mavlink_int - converts an AP_Mission::Mission_Command object to a mavlink message which can be sent to the GCS
 //  return true on success, false on failure
 bool AP_Mission::mission_cmd_to_mavlink_int(const AP_Mission::Mission_Command& cmd, mavlink_mission_item_int_t& packet)
 {
@@ -1227,7 +1279,7 @@ bool AP_Mission::mission_cmd_to_mavlink_int(const AP_Mission::Mission_Command& c
         packet.param1 = cmd.p1;                         // on/off. >0.5 means "on", hand-over control to external controller
         break;
 
-    case MAV_CMD_NAV_DELAY:                            // MAV ID: 94
+    case MAV_CMD_NAV_DELAY:                            // MAV ID: 93
         packet.param1 = cmd.content.nav_delay.seconds; // delay in seconds
         packet.param2 = cmd.content.nav_delay.hour_utc; // absolute time's day of week (utc)
         packet.param3 = cmd.content.nav_delay.min_utc; // absolute time's hour (utc)
@@ -1401,6 +1453,10 @@ bool AP_Mission::mission_cmd_to_mavlink_int(const AP_Mission::Mission_Command& c
         packet.param4 = cmd.content.winch.release_rate;     // release rate in meters/second
         break;
 
+    case MAV_CMD_DO_SET_RESUME_REPEAT_DIST:
+        packet.param1 = cmd.p1; // Resume repeat distance (m)
+        break;
+
     default:
         // unrecognised command
         return false;
@@ -1453,6 +1509,7 @@ void AP_Mission::complete()
 {
     // flag mission as complete
     _flags.state = MISSION_COMPLETE;
+    _flags.in_landing_sequence = false;
 
     // callback to main program's mission complete function
     _mission_complete_fn();
@@ -1514,6 +1571,22 @@ bool AP_Mission::advance_current_nav_cmd(uint16_t starting_index)
             if (start_command(_nav_cmd)) {
                 _flags.nav_cmd_loaded = true;
             }
+            // save a loaded wp index in history array for when _repeat_dist is set via MAV_CMD_DO_SET_RESUME_REPEAT_DIST
+            // and prevent history being re-written until vehicle returns to interupted position
+            if(_repeat_dist > 0 && !_flags.resuming_mission && _nav_cmd.index != AP_MISSION_CMD_INDEX_NONE && !(_nav_cmd.content.location.lat == 0 && _nav_cmd.content.location.lng == 0)) {
+                // update mission history. last index position is always the most recent wp loaded.
+                for (uint8_t i=0; i<AP_MISSION_MAX_WP_HISTORY-1; i++) {
+                    _wp_index_history[i] = _wp_index_history[i+1];
+                }
+                _wp_index_history[AP_MISSION_MAX_WP_HISTORY-1] = _nav_cmd.index;
+            }
+            // check if the vehicle is resuming and has returned to where it was interupted
+            if (_flags.resuming_mission && _nav_cmd.index == _wp_index_history[AP_MISSION_MAX_WP_HISTORY-1]) {
+                // vehicle has resumed previous position
+                gcs().send_text(MAV_SEVERITY_INFO, "Mission: Returned to interupted WP");
+                _flags.resuming_mission = false;
+            }
+
         }else{
             // set current do command and start it (if not already set)
             if (!_flags.do_cmd_loaded) {
@@ -1576,7 +1649,7 @@ void AP_Mission::advance_current_do_cmd()
 ///     returns true if found, false if not found (i.e. mission complete)
 ///     accounts for do_jump commands
 ///     increment_jump_num_times_if_found should be set to true if advancing the active navigation command
-bool AP_Mission::get_next_cmd(uint16_t start_index, Mission_Command& cmd, bool increment_jump_num_times_if_found)
+bool AP_Mission::get_next_cmd(uint16_t start_index, Mission_Command& cmd, bool increment_jump_num_times_if_found, bool send_gcs_msg)
 {
     uint16_t cmd_index = start_index;
     Mission_Command temp_cmd;
@@ -1625,8 +1698,8 @@ bool AP_Mission::get_next_cmd(uint16_t start_index, Mission_Command& cmd, bool i
                 int16_t jump_times_run = get_jump_times_run(temp_cmd);
                 if (jump_times_run < temp_cmd.content.jump.num_times) {
                     // update the record of the number of times run
-                    if (increment_jump_num_times_if_found) {
-                        increment_jump_times_run(temp_cmd);
+                    if (increment_jump_num_times_if_found && !_flags.resuming_mission) {
+                        increment_jump_times_run(temp_cmd, send_gcs_msg);
                     }
                     // continue searching from jump target
                     cmd_index = temp_cmd.content.jump.target;
@@ -1713,7 +1786,7 @@ int16_t AP_Mission::get_jump_times_run(const Mission_Command& cmd)
 }
 
 /// increment_jump_times_run - increments the recorded number of times the jump command has been run
-void AP_Mission::increment_jump_times_run(Mission_Command& cmd)
+void AP_Mission::increment_jump_times_run(Mission_Command& cmd, bool send_gcs_msg)
 {
     // exit immediately if cmd is not a do-jump command
     if (cmd.id != MAV_CMD_DO_JUMP) {
@@ -1725,7 +1798,9 @@ void AP_Mission::increment_jump_times_run(Mission_Command& cmd)
     for (uint8_t i=0; i<AP_MISSION_MAX_NUM_DO_JUMP_COMMANDS; i++) {
         if (_jump_tracking[i].index == cmd.index) {
             _jump_tracking[i].num_times_run++;
-            gcs().send_text(MAV_SEVERITY_INFO, "Mission: %u Jump %i/%i", _jump_tracking[i].index, _jump_tracking[i].num_times_run, cmd.content.jump.num_times);
+            if (send_gcs_msg) {
+                gcs().send_text(MAV_SEVERITY_INFO, "Mission: %u Jump %i/%i", _jump_tracking[i].index, _jump_tracking[i].num_times_run, cmd.content.jump.num_times);
+            }
             return;
         }else if(_jump_tracking[i].index == AP_MISSION_CMD_INDEX_NONE) {
             // we've searched through all known jump commands and haven't found it so allocate new space in _jump_tracking array
@@ -1811,6 +1886,7 @@ bool AP_Mission::jump_to_landing_sequence(void)
         }
 
         gcs().send_text(MAV_SEVERITY_INFO, "Landing sequence start");
+        _flags.in_landing_sequence = true;
         return true;
     }
 
@@ -1849,12 +1925,148 @@ bool AP_Mission::jump_to_abort_landing_sequence(void)
             resume();
         }
 
+        _flags.in_landing_sequence = false;
+
         gcs().send_text(MAV_SEVERITY_INFO, "Landing abort sequence start");
         return true;
     }
 
     gcs().send_text(MAV_SEVERITY_WARNING, "Unable to start find a landing abort sequence");
     return false;
+}
+
+// check which is the shortest route to landing an RTL via a DO_LAND_START or continuing on the current mission plan
+bool AP_Mission::is_best_land_sequence(void)
+{
+    // check if there is even a running mission to interupt
+    if (_flags.state != MISSION_RUNNING) {
+        return false;
+    }
+
+    // check if aircraft has already jumped to a landing sequence
+    if (_flags.in_landing_sequence) {
+        return true;
+    }
+
+    // check if MIS_OPTIONS bit set to allow distance calculation to be done
+    if (!(_options & AP_MISSION_MASK_DIST_TO_LAND_CALC)) {
+        return false;
+    }
+
+    // The decision to allow a failsafe to interupt a potential landing approach 
+    // is a distance travelled minimization problem.  Look forward in 
+    // mission to evaluate the shortest remaining distance to land.
+
+    // go through the mission for the nearest DO_LAND_START first as this is the most probable route 
+    // to a landing with the minimum number of WP.
+    uint16_t do_land_start_index = get_landing_sequence_start();
+    if (do_land_start_index == 0) {
+        // then no DO_LAND_START commands are in mission and normal failsafe behaviour should be maintained
+        return false;
+    }
+
+    // get our current location
+    Location current_loc;
+    if (!AP::ahrs().get_position(current_loc)) {
+        // we don't know where we are!!
+        return false;
+    }
+
+    // get distance to landing if travelled to nearest DO_LAND_START via RTL
+    float dist_via_do_land;
+    if (!distance_to_landing(do_land_start_index, dist_via_do_land, current_loc)) {
+        // cant get a valid distance to landing
+        return false;
+    }
+
+    // get distance to landing if continue along current mission path
+    float dist_continue_to_land;
+    if (!distance_to_landing(_nav_cmd.index, dist_continue_to_land, current_loc)) {
+        // cant get a valid distance to landing
+        return false;
+    }
+
+    // compare distances
+    if (dist_via_do_land >= dist_continue_to_land) {
+        // then the mission should carry on uninterrupted as that is the shorter distance
+        gcs().send_text(MAV_SEVERITY_NOTICE, "Rejecting RTL: closer land if mis continued");
+        return true;
+    } else {
+        // allow failsafes to interrupt the current mission
+        return false;
+    }
+}
+
+// Approximate the distance travelled to get to a landing.  DO_JUMP commands are observed in look forward.
+bool AP_Mission::distance_to_landing(uint16_t index, float &tot_distance, Location prev_loc)
+{
+    Mission_Command temp_cmd;
+    tot_distance = 0.0f;
+    bool ret;
+
+    // back up jump tracking to reset after distance calculation
+    jump_tracking_struct _jump_tracking_backup[AP_MISSION_MAX_NUM_DO_JUMP_COMMANDS];
+    for (uint8_t i=0; i<AP_MISSION_MAX_NUM_DO_JUMP_COMMANDS; i++) {
+        _jump_tracking_backup[i] = _jump_tracking[i];
+    }
+
+    // run through remainder of mission to approximate a distance to landing
+    for (uint8_t i=0; i<255; i++) {
+        // search until the end of the mission command list
+        for (uint16_t cmd_index = index; cmd_index < (unsigned)_cmd_total; cmd_index++) {
+            // get next command
+            if (!get_next_cmd(cmd_index, temp_cmd, true, false)) {
+                // we got to the end of the mission
+                ret = false;
+                goto reset_do_jump_tracking;
+            }
+            if (temp_cmd.id == MAV_CMD_NAV_WAYPOINT || temp_cmd.id == MAV_CMD_NAV_SPLINE_WAYPOINT || is_landing_type_cmd(temp_cmd.id)) {
+                break;
+            } else if (is_nav_cmd(temp_cmd) || temp_cmd.id == MAV_CMD_CONDITION_DELAY) {
+                // if we receive a nav command that we dont handle then give up as cant measure the distance e.g. MAV_CMD_NAV_LOITER_UNLIM
+                ret = false;
+                goto reset_do_jump_tracking;
+            }
+        }
+        index = temp_cmd.index+1;
+
+        if (!(temp_cmd.content.location.lat == 0 && temp_cmd.content.location.lng == 0)) {
+            // add distance to running total
+            float disttemp = prev_loc.get_distance(temp_cmd.content.location);
+            tot_distance = tot_distance + disttemp;
+
+            // store wp location as previous
+            prev_loc = temp_cmd.content.location;
+        }
+
+        if (is_landing_type_cmd(temp_cmd.id)) {
+            // reached a landing!
+            ret = true;
+            goto reset_do_jump_tracking;
+        }
+    }
+    // reached end of loop without getting to a landing
+    ret = false;
+
+reset_do_jump_tracking:
+    for (uint8_t i=0; i<AP_MISSION_MAX_NUM_DO_JUMP_COMMANDS; i++) {
+        _jump_tracking[i] = _jump_tracking_backup[i];
+    }
+
+    return ret;
+}
+
+// check if command is a landing type command.
+bool AP_Mission::is_landing_type_cmd(uint16_t id) const
+{
+    switch (id) {
+        case MAV_CMD_NAV_LAND:
+        case MAV_CMD_NAV_VTOL_LAND:
+        case MAV_CMD_DO_PARACHUTE:
+            return true;
+        default:
+            return false;
+    }
 }
 
 const char *AP_Mission::Mission_Command::type() const {
@@ -1905,6 +2117,8 @@ const char *AP_Mission::Mission_Command::type() const {
         return "SetROI";
     case MAV_CMD_DO_SET_REVERSE:
         return "SetReverse";
+    case MAV_CMD_DO_SET_RESUME_REPEAT_DIST:
+        return "SetRepeatDist";
     case MAV_CMD_DO_GUIDED_LIMITS:
         return "GuidedLimits";
     case MAV_CMD_NAV_TAKEOFF:
@@ -1941,6 +2155,8 @@ const char *AP_Mission::Mission_Command::type() const {
         return "PayloadPlace";
     case MAV_CMD_DO_PARACHUTE:
         return "Parachute";
+    case MAV_CMD_DO_MOUNT_CONTROL:
+        return "MountControl";
 
     default:
 #if CONFIG_HAL_BOARD == HAL_BOARD_SITL
@@ -1962,6 +2178,114 @@ bool AP_Mission::contains_item(MAV_CMD command) const
         }
     }
     return false;
+}
+
+// reset the mission history to prevent recalling previous mission histories after a mission restart.
+void AP_Mission::reset_wp_history(void)
+{
+    for (uint8_t i = 0; i<AP_MISSION_MAX_WP_HISTORY; i++) {
+        _wp_index_history[i] = AP_MISSION_CMD_INDEX_NONE;
+    }
+    _resume_cmd.index = AP_MISSION_CMD_INDEX_NONE;
+    _flags.resuming_mission = false;
+    _repeat_dist = 0;
+}
+
+// store the latest reported position incase of mission exit and rewind resume
+void AP_Mission::update_exit_position(void)
+{
+    if (!AP::ahrs().get_position(_exit_position)) {
+        _exit_position.lat = 0;
+        _exit_position.lng = 0;
+    }
+}
+
+// calculate the location of the _resume_cmd wp and set as current
+bool AP_Mission::calc_rewind_pos(Mission_Command& rewind_cmd)
+{
+    // check for a recent history
+    if (_wp_index_history[LAST_WP_PASSED] == AP_MISSION_CMD_INDEX_NONE) {
+        // no saved history so can't rewind
+        return false;
+    }
+
+    // check that we have a valid exit position
+    if (_exit_position.lat == 0 && _exit_position.lng == 0) {
+        return false;
+    }
+
+    Mission_Command temp_cmd;
+    float rewind_distance = _repeat_dist; //(m)
+    uint16_t resume_index;
+    Location prev_loc = _exit_position;
+
+    for (int8_t i = (LAST_WP_PASSED); i>=0; i--) {
+
+        // to get this far there has to be at least one 'passed wp' stored in history.  This is to check incase 
+        // of history array no being completely filled with valid waypoints upon resume.
+        if (_wp_index_history[i] == AP_MISSION_CMD_INDEX_NONE) {
+            // no more stored history
+            resume_index = i+1;
+            break;
+        }
+
+        if (!read_cmd_from_storage(_wp_index_history[i], temp_cmd)) {
+            // if read from storage failed then don't use rewind
+            return false;
+        }
+
+        // calculate distance
+        float disttemp = prev_loc.get_distance(temp_cmd.content.location); //(m)
+        rewind_distance -= disttemp;
+        resume_index = i;
+
+        if (rewind_distance <= 0.0f) {
+            // history rewound enough distance to meet _repeat_dist requirement
+            rewind_cmd = temp_cmd;
+            break;
+        }
+
+        // store wp location as previous
+        prev_loc = temp_cmd.content.location;
+    }
+
+    if (rewind_distance > 0.0f) {
+        // then the history array was rewound all of the way without finding a wp distance > _repeat_dist distance.
+        // the last read temp_cmd will be the furthest cmd back in the history array so resume to that.
+        rewind_cmd = temp_cmd;
+        return true;
+    }
+
+    // if we have got this far the desired rewind distance lies between two waypoints stored in history array.
+    // calculate the location for the mission to resume
+
+    // the last wp read from storage is the wp that is before the resume wp in the mission order
+    Location passed_wp_loc = temp_cmd.content.location;
+
+    // fetch next destination wp
+    if (!read_cmd_from_storage(_wp_index_history[resume_index+1], temp_cmd)) {
+        // if read from storage failed then don't use rewind
+        return false;
+    }
+
+    // determine the length of the mission leg that the resume wp lies in
+    float leg_length = passed_wp_loc.get_distance(temp_cmd.content.location); //(m)
+
+    // calculate the percentage along the leg that resume wp will be positioned
+    float leg_percent = fabsf(rewind_distance)/leg_length;
+
+    // calculate difference vector of mission leg
+    Vector3f dist_vec = passed_wp_loc.get_distance_NED(temp_cmd.content.location);
+
+    // calculate the resume wp position
+    rewind_cmd.content.location.offset(dist_vec.x * leg_percent, dist_vec.y * leg_percent);
+    rewind_cmd.content.location.alt -= dist_vec.z * leg_percent * 100; //(cm)
+
+    // The rewind_cmd.index has the index of the 'last passed wp' from the history array.  This ensures that the mission order
+    // continues as planned without further intervention.  The resume wp is not written to memory so will not perminantely change the mission.
+
+    // if we got this far then mission rewind position was successfully calculated
+    return true;
 }
 
 // singleton instance

@@ -19,13 +19,16 @@ import sys
 import gzip
 
 # local imports
-import generate_manifest
-
+import generate_manifest, gen_stable
+import build_binaries_history
 
 class build_binaries(object):
     def __init__(self, tags):
         self.tags = tags
         self.dirty = False
+        binaries_history_filepath = os.path.join(self.buildlogs_dirpath(),
+                                                 "build_binaries_history.sqlite")
+        self.history = build_binaries_history.BuildBinariesHistory(binaries_history_filepath)
 
     def progress(self, string):
         '''pretty-print progress'''
@@ -100,7 +103,7 @@ class build_binaries(object):
                           "--recursive",
                           "-f"])
 
-    def checkout(self, vehicle, ctag, cboard=None, cframe=None):
+    def checkout(self, vehicle, ctag, cboard=None, cframe=None, submodule_update=True):
         '''attempt to check out a git tree.  Various permutations are
 attempted based on ctag - for examplle, if the board is avr and ctag
 is bob we will attempt to checkout bob-AVR'''
@@ -131,12 +134,12 @@ is bob we will attempt to checkout bob-AVR'''
             try:
                 self.progress("Trying branch %s" % branch)
                 self.run_git(["checkout", "-f", branch])
-                self.run_git_update_submodules()
+                if submodule_update:
+                    self.run_git_update_submodules()
                 self.run_git(["log", "-1"])
                 return True
             except subprocess.CalledProcessError:
                 self.progress("Checkout branch %s failed" % branch)
-                pass
 
         self.progress("Failed to find tag for %s %s %s %s" %
                       (vehicle, ctag, cboard, cframe))
@@ -172,7 +175,7 @@ is bob we will attempt to checkout bob-AVR'''
     def skip_frame(self, board, frame):
         '''returns true if this board/frame combination should not be built'''
         if frame == "heli":
-            if board in ["bebop", "aerofc-v1", "skyviper-v2450", "CubeSolo", "CubeGreen-solo"]:
+            if board in ["bebop", "aerofc-v1", "skyviper-v2450", "CubeSolo", "CubeGreen-solo", 'skyviper-journey']:
                 self.progress("Skipping heli build for %s" % board)
                 return True
         return False
@@ -224,12 +227,18 @@ is bob we will attempt to checkout bob-AVR'''
         with open(filepath, "w") as x:
             x.write(string)
 
+    def version_h_path(self, src):
+        '''return path to version.h'''
+        if src == 'AP_Periph':
+            return os.path.join('Tools', src, "version.h")
+        return os.path.join(src, "version.h")
+
     def addfwversion_gitversion(self, destdir, src):
         # create git-version.txt:
         gitlog = self.run_git(["log", "-1"])
         gitversion_filepath = os.path.join(destdir, "git-version.txt")
         gitversion_content = gitlog
-        versionfile = os.path.join(src, "version.h")
+        versionfile = self.version_h_path(src)
         if os.path.exists(versionfile):
             content = self.read_string_from_filepath(versionfile)
             match = re.search('define.THISFIRMWARE "([^"]+)"', content)
@@ -246,7 +255,7 @@ is bob we will attempt to checkout bob-AVR'''
 
     def addfwversion_firmwareversiontxt(self, destdir, src):
         # create firmware-version.txt
-        versionfile = os.path.join(src, "version.h")
+        versionfile = self.version_h_path(src)
         if not os.path.exists(versionfile):
             self.progress("%s does not exist" % (versionfile,))
             return
@@ -325,8 +334,13 @@ is bob we will attempt to checkout bob-AVR'''
         self.progress("Building %s %s binaries (cwd=%s)" %
                       (vehicle, tag, os.getcwd()))
 
-        for board in boards:
-            self.progress("Building board: %s" % board)
+        board_count = len(boards)
+        count = 0
+        for board in sorted(boards, key=str.lower):
+            now = datetime.datetime.now()
+            count += 1
+            self.progress("[%u/%u] Building board: %s at %s" %
+                          (count, board_count, board, str(now)))
             for frame in frames:
                 if frame is not None:
                     self.progress("Considering frame %s for board %s" %
@@ -335,14 +349,13 @@ is bob we will attempt to checkout bob-AVR'''
                     framesuffix = ""
                 else:
                     framesuffix = "-%s" % frame
-                if not self.checkout(vehicle, tag, board, frame):
+                if not self.checkout(vehicle, tag, board, frame, submodule_update=False):
                     msg = ("Failed checkout of %s %s %s %s" %
                            (vehicle, board, tag, frame,))
                     self.progress(msg)
                     self.error_strings.append(msg)
                     continue
-                if self.skip_board_waf(board):
-                    continue
+
                 self.progress("Building %s %s %s binaries %s" %
                               (vehicle, tag, board, frame))
                 ddir = os.path.join(self.binaries,
@@ -355,10 +368,21 @@ is bob we will attempt to checkout bob-AVR'''
                 if self.skip_frame(board, frame):
                     continue
 
+                # we do the submodule update after the skip_board_waf check to avoid doing it on
+                # builds we will not be running
+                self.run_git_update_submodules()
+
+                if self.skip_board_waf(board):
+                    continue
+                
                 if os.path.exists(self.buildroot):
                     shutil.rmtree(self.buildroot)
 
                 self.remove_tmpdir()
+
+                githash = self.run_git(["rev-parse", "HEAD"]).rstrip()
+
+                t0 = time.time()
 
                 self.progress("Configuring for %s in %s" %
                               (board, self.buildroot))
@@ -381,19 +405,34 @@ is bob we will attempt to checkout bob-AVR'''
                            (vehicle, board, framesuffix, tag))
                     self.progress(msg)
                     self.error_strings.append(msg)
+                    # record some history about this build
+                    t1 = time.time()
+                    time_taken_to_build = t1-t0
+                    self.history.record_build(githash, tag, vehicle, board, frame, None, t0, time_taken_to_build)
                     continue
+
+                t1 = time.time()
+                time_taken_to_build = t1-t0
+                self.progress("Building %s %s %s %s took %u seconds" %
+                              (vehicle, tag, board, frame, time_taken_to_build))
 
                 bare_path = os.path.join(self.buildroot,
                                          board,
                                          "bin",
                                          "".join([binaryname, framesuffix]))
                 files_to_copy = []
-                for extension in [".px4", ".apj", ".abin", "_with_bl.hex", ".hex"]:
+                extensions = [".px4", ".apj", ".abin", "_with_bl.hex", ".hex"]
+                if vehicle == 'AP_Periph':
+                    # need bin file for uavcan-gui-tool and MissionPlanner
+                    extensions.append('.bin')
+                for extension in extensions:
                     filepath = "".join([bare_path, extension])
                     if os.path.exists(filepath):
                         files_to_copy.append(filepath)
+                if not os.path.exists(bare_path):
+                    raise Exception("No elf file?!")
                 # only copy the elf if we don't have other files to copy
-                if os.path.exists(bare_path) and len(files_to_copy) == 0:
+                if len(files_to_copy) == 0:
                     files_to_copy.append(bare_path)
 
                 for path in files_to_copy:
@@ -404,6 +443,9 @@ is bob we will attempt to checkout bob-AVR'''
                 # why is touching this important? -pb20170816
                 self.touch_filepath(os.path.join(self.binaries,
                                                  vehicle_binaries_subdir, tag))
+
+                # record some history about this build
+                self.history.record_build(githash, tag, vehicle, board, frame, bare_path, t0, time_taken_to_build)
 
         if not self.checkout(vehicle, tag, "PX4", None):
             self.checkout(vehicle, "latest")
@@ -500,7 +542,6 @@ is bob we will attempt to checkout bob-AVR'''
 
     def common_boards(self):
         '''returns list of boards common to all vehicles'''
-        # note that while we do not use these for AntennaTracker!
         return ["fmuv2",
                 "fmuv3",
                 "fmuv4",
@@ -514,11 +555,14 @@ is bob we will attempt to checkout bob-AVR'''
                 "pxfmini",
                 "KakuteF4",
                 "KakuteF7",
+                "KakuteF7Mini",
                 "MatekF405",
                 "MatekF405-STD",
                 "MatekF405-Wing",
+                "MatekF765-Wing",
                 "OMNIBUSF7V2",
                 "sparky2",
+                "omnibusf4",
                 "omnibusf4pro",
                 "omnibusf4v6",
                 "OmnibusNanoV6",
@@ -526,19 +570,23 @@ is bob we will attempt to checkout bob-AVR'''
                 "airbotf4",
                 "revo-mini",
                 "CubeBlack",
+                "CubeBlack+",
                 "CubePurple",
                 "Pixhawk1",
+                "Pixhawk1-1M",
                 "Pixhawk4",
                 "PH4-mini",
                 "CUAVv5",
                 "CUAVv5Nano",
+                "CUAV-Nora",
                 "mRoX21",
                 "Pixracer",
                 "F4BY",
                 "mRoX21-777",
-                "mRControlZeroF7",
+                "mRoControlZeroF7",
                 "F35Lightning",
                 "speedybeef4",
+                "SuccexF4",
                 "DrotekP3Pro",
                 "VRBrain-v51",
                 "VRBrain-v52",
@@ -546,18 +594,31 @@ is bob we will attempt to checkout bob-AVR'''
                 "VRCore-v10",
                 "VRBrain-v54",
                 "TBS-Colibri-F7",
-                "Pixhawk6",
+                "Durandal",
                 "CubeOrange",
                 "CubeYellow",
+                "R9Pilot",
                 # SITL targets
                 "SITL_x86_64_linux_gnu",
                 "SITL_arm_linux_gnueabihf",
                 ]
 
+    def AP_Periph_boards(self):
+        '''returns list of boards for AP_Periph'''
+        return ["f103-GPS",
+                "f103-ADSB",
+                "f103-RangeFinder",
+                "f303-GPS",
+                "f303-Universal",
+                "f303-M10025",
+                "CUAV_GPS",
+                "ZubaxGNSS",
+                ]
+
     def build_arducopter(self, tag):
         '''build Copter binaries'''
         boards = []
-        boards.extend(["skyviper-v2450", "aerofc-v1", "bebop", "CubeSolo", "CubeGreen-solo"])
+        boards.extend(["skyviper-v2450", "aerofc-v1", "bebop", "CubeSolo", "CubeGreen-solo", "skyviper-journey"])
         boards.extend(self.common_boards()[:])
         self.build_vehicle(tag,
                            "ArduCopter",
@@ -607,10 +668,21 @@ is bob we will attempt to checkout bob-AVR'''
                            "ardusub",
                            "ArduSub")
 
+    def build_AP_Periph(self, tag):
+        '''build AP_Periph binaries'''
+        boards = self.AP_Periph_boards()
+        self.build_vehicle(tag,
+                           "AP_Periph",
+                           boards,
+                           "AP_Periph",
+                           "AP_Periph",
+                           "AP_Periph")
+
+        
     def generate_manifest(self):
         '''generate manigest files for GCS to download'''
         self.progress("Generating manifest")
-        base_url = 'http://firmware.ardupilot.org'
+        base_url = 'https://firmware.ardupilot.org'
         generator = generate_manifest.ManifestGenerator(self.binaries,
                                                         base_url)
         content = generator.json()
@@ -627,6 +699,11 @@ is bob we will attempt to checkout bob-AVR'''
         shutil.move(new_json_filepath, json_filepath)
         shutil.move(new_json_filepath_gz, json_filepath_gz)
         self.progress("Manifest generation successful")
+
+        self.progress("Generating stable releases")
+        gen_stable.make_all_stable(self.binaries)
+        self.progress("Generate stable releases done")
+
 
     def validate(self):
         '''run pre-run validation checks'''
@@ -653,6 +730,10 @@ is bob we will attempt to checkout bob-AVR'''
             self.progress("Removing (%s)" % (self.tmpdir,))
             shutil.rmtree(self.tmpdir)
 
+    def buildlogs_dirpath(self):
+        return os.getenv("BUILDLOGS",
+                         os.path.join(os.getcwd(), "..", "buildlogs"))
+
     def run(self):
         self.validate()
 
@@ -661,7 +742,10 @@ is bob we will attempt to checkout bob-AVR'''
         origin_env_path = os.environ.get("PATH")
         os.environ["PATH"] = ':'.join([prefix_bin_dirpath, origin_env_path,
                                        "/bin", "/usr/bin"])
-        self.tmpdir = os.path.join(os.getcwd(), 'build.tmp.binaries')
+        if 'BUILD_BINARIES_PATH' in os.environ:
+            self.tmpdir = os.environ['BUILD_BINARIES_PATH']
+        else:
+            self.tmpdir = os.path.join(os.getcwd(), 'build.tmp.binaries')
         os.environ["TMPDIR"] = self.tmpdir
 
         print(self.tmpdir)
@@ -683,8 +767,7 @@ is bob we will attempt to checkout bob-AVR'''
 
         self.mkpath(os.path.join("binaries", self.hdate_ym,
                                  self.hdate_ymdhm))
-        self.binaries = os.path.join(os.getcwd(), "..", "buildlogs",
-                                     "binaries")
+        self.binaries = os.path.join(self.buildlogs_dirpath(), "binaries")
         self.basedir = os.getcwd()
         self.error_strings = []
 
@@ -698,11 +781,14 @@ is bob we will attempt to checkout bob-AVR'''
                                       "binaries.build")
 
         for tag in self.tags:
+            t0 = time.time()
             self.build_arducopter(tag)
             self.build_arduplane(tag)
             self.build_rover(tag)
             self.build_antennatracker(tag)
             self.build_ardusub(tag)
+            self.build_AP_Periph(tag)
+            self.history.record_run(githash, tag, t0, time.time()-t0)
 
         if os.path.exists(self.tmpdir):
             shutil.rmtree(self.tmpdir)
