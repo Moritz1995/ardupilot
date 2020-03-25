@@ -529,6 +529,7 @@ const AP_Param::Info Copter::var_info[] = {
 #if MODE_ACRO_ENABLED == ENABLED || MODE_SPORT_ENABLED == ENABLED
     // @Param: ACRO_BAL_ROLL
     // @DisplayName: Acro Balance Roll
+<<<<<<< HEAD
     // @User: Standard
     // @RebootRequired: True
     GSCALAR(frame_type, "FRAME_TYPE", HAL_FRAME_TYPE_DEFAULT),
@@ -624,6 +625,8 @@ const AP_Param::Info Copter::var_info[] = {
 #if MODE_ACRO_ENABLED == ENABLED || MODE_SPORT_ENABLED == ENABLED
     // @Param: ACRO_BAL_ROLL
     // @DisplayName: Acro Balance Roll
+=======
+>>>>>>> 1f035bfad85ae004629f9a40ca64d8d2c89a61f2
     // @Description: rate at which roll angle returns to level in acro and sport mode.  A higher value causes the vehicle to return to level faster. For helicopter sets the decay rate of the virtual flybar in the roll axis. A higher value causes faster decay of desired to actual attitude.
     // @Range: 0 3
     // @Increment: 0.1
